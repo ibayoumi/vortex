@@ -1,5 +1,6 @@
 #include <vortex2.h>
 #include "common.h"
+#include "trace_loader.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,7 @@
 namespace {
 
 const char* kernel_file = "kernel.vxbin";
+const char* trace_file = nullptr;
 
 uint32_t num_motions = 16;
 uint32_t poses_per_motion = 8;
@@ -46,7 +48,7 @@ uint32_t parse_count(const char* value, const char* name) {
 void parse_args(int argc, char** argv) {
     int c;
 
-    while ((c = getopt(argc, argv, "n:p:o:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:p:o:k:t:h")) != -1) {
         switch (c) {
             case 'n':
                 num_motions = parse_count(optarg, "-n");
@@ -64,10 +66,15 @@ void parse_args(int argc, char** argv) {
                 kernel_file = optarg;
                 break;
 
+            case 't':
+                trace_file = optarg;
+                break;
+
             case 'h':
                 std::cout
                     << "Usage: [-k kernel] [-n motions] "
-                    << "[-p poses_per_motion] [-o obstacles] [-h]"
+                    << "[-p poses_per_motion] [-o obstacles] "
+                    << "[-t trace_file] [-h]"
                     << std::endl;
                 std::exit(0);
 
@@ -76,7 +83,7 @@ void parse_args(int argc, char** argv) {
         }
     }
 
-    if (poses_per_motion < 3) {
+    if (trace_file == nullptr && poses_per_motion < 3) {
         std::cerr
             << "At least 3 poses per motion are required for "
             << "the intermediate/final collision test cases."
@@ -87,7 +94,8 @@ void parse_args(int argc, char** argv) {
     uint64_t total_boxes =
         static_cast<uint64_t>(num_motions) * poses_per_motion;
 
-    if (total_boxes > std::numeric_limits<uint32_t>::max()) {
+    if (trace_file == nullptr &&
+        total_boxes > std::numeric_limits<uint32_t>::max()) {
         std::cerr << "Total number of robot boxes exceeds the "
                   << "32-bit kernel indexing limit."
                   << std::endl;
@@ -273,13 +281,120 @@ void generate_motions(std::vector<aabb_t>& robot_boxes) {
     }
 }
 
+uint32_t cpu_quantize_feature(float value) {
+    for (uint32_t i = 0; i < 16; ++i) {
+        float threshold = -1.0f + 0.125f * static_cast<float>(i);
+
+        if (value <= threshold) {
+            return i;
+        }
+    }
+
+    return 16;
+}
+
+uint32_t cpu_pack_feature_key(
+    uint32_t bx,
+    uint32_t by,
+    uint32_t bz) {
+
+    return bx * 17 * 17 + by * 17 + bz;
+}
+
+trace_result_t cpu_trace_motion_check(
+    uint32_t motion_id,
+    const mpnet_trace_t& trace) {
+
+    trace_result_t result{};
+
+    uint64_t pose_begin = trace.motion_offsets[motion_id];
+    uint64_t pose_end = trace.motion_offsets[motion_id + 1];
+
+    for (uint64_t pose_id = pose_begin;
+         pose_id < pose_end;
+         ++pose_id) {
+
+        uint64_t query_begin = trace.pose_offsets[pose_id];
+        uint64_t query_end = trace.pose_offsets[pose_id + 1];
+
+        for (uint64_t query_id = query_begin;
+             query_id < query_end;
+             ++query_id) {
+
+            const trace_feature_t& feature =
+                trace.features[query_id];
+
+            uint32_t bx = cpu_quantize_feature(feature.x);
+            uint32_t by = cpu_quantize_feature(feature.y);
+            uint32_t bz = cpu_quantize_feature(feature.z);
+
+            uint32_t key = cpu_pack_feature_key(bx, by, bz);
+
+            result.key_checksum += key;
+            ++result.query_count;
+
+            if (trace.labels[query_id] == 0) {
+                result.collision = 1;
+            }
+        }
+    }
+
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     parse_args(argc, argv);
 
+    const bool trace_mode = (trace_file != nullptr);
+
+    // ----- Optionally load the MPNet trace -----
+
+    mpnet_trace_t trace;
+
+    if (trace_mode) {
+        std::string error;
+
+        if (!load_mpnet_trace(trace_file, &trace, &error)) {
+            std::cerr << "Trace loading failed: " << error
+                      << std::endl;
+            return 1;
+        }
+
+        if (trace.num_motions() == 0 ||
+            trace.num_motions() >
+                std::numeric_limits<uint32_t>::max()) {
+            std::cerr << "Invalid or unsupported trace motion count."
+                      << std::endl;
+            return 1;
+        }
+
+        num_motions = static_cast<uint32_t>(trace.num_motions());
+
+        uint64_t collision_count = 0;
+        for (uint8_t label : trace.labels) {
+            collision_count += (label == 0);
+        }
+
+        std::cout << "MPNet trace loaded successfully:" << std::endl;
+        std::cout << "  File:       " << trace_file << std::endl;
+        std::cout << "  Version:    " << trace.version << std::endl;
+        std::cout << "  Benchmarks: " << trace.benchmark_ids.size() << std::endl;
+        std::cout << "  Motions:    " << trace.num_motions() << std::endl;
+        std::cout << "  Poses:      " << trace.num_poses() << std::endl;
+        std::cout << "  Queries:    " << trace.num_queries() << std::endl;
+        std::cout << "  Collisions: " << collision_count << std::endl;
+        std::cout << "  Free:       "
+                  << trace.num_queries() - collision_count << std::endl;
+    }
+
+    // ----- Prepare host-side workload data -----
+
     const uint64_t num_robot_boxes =
-        static_cast<uint64_t>(num_motions) * poses_per_motion;
+        trace_mode
+            ? 0
+            : static_cast<uint64_t>(num_motions) * poses_per_motion;
 
     const uint64_t robot_buf_size =
         num_robot_boxes * sizeof(aabb_t);
@@ -288,26 +403,37 @@ int main(int argc, char** argv) {
         static_cast<uint64_t>(num_obstacles) * sizeof(aabb_t);
 
     const uint64_t results_buf_size =
-        static_cast<uint64_t>(num_motions) * sizeof(uint32_t);
+        static_cast<uint64_t>(num_motions) *
+        (trace_mode ? sizeof(trace_result_t) : sizeof(uint32_t));
 
-    std::cout << "collision_detection vortex2:"
-              << " motions=" << num_motions
-              << " poses_per_motion=" << poses_per_motion
-              << " obstacles=" << num_obstacles
-              << " total_robot_boxes=" << num_robot_boxes
-              << std::endl;
+    std::vector<aabb_t> h_robots;
+    std::vector<aabb_t> h_obstacles;
+    std::vector<uint32_t> h_results;
+    std::vector<trace_result_t> h_trace_results;
 
-    // ----- Generate deterministic input data -----
+    if (trace_mode) {
+        h_trace_results.resize(num_motions);
 
-    std::vector<aabb_t> h_robots(
-        static_cast<size_t>(num_robot_boxes));
+        std::cout << "Trace replay workload:"
+                  << " motions=" << num_motions
+                  << " poses=" << trace.num_poses()
+                  << " queries=" << trace.num_queries()
+                  << std::endl;
+    } else {
+        h_robots.resize(static_cast<size_t>(num_robot_boxes));
+        h_obstacles.resize(num_obstacles);
+        h_results.resize(num_motions, 0);
 
-    std::vector<aabb_t> h_obstacles(num_obstacles);
+        generate_obstacles(h_obstacles);
+        generate_motions(h_robots);
 
-    std::vector<uint32_t> h_results(num_motions, 0);
-
-    generate_obstacles(h_obstacles);
-    generate_motions(h_robots);
+        std::cout << "collision_detection vortex2:"
+                  << " motions=" << num_motions
+                  << " poses_per_motion=" << poses_per_motion
+                  << " obstacles=" << num_obstacles
+                  << " total_robot_boxes=" << num_robot_boxes
+                  << std::endl;
+    }
 
     // ----- Open device and create queue -----
 
@@ -327,14 +453,51 @@ int main(int argc, char** argv) {
     vx_buffer_h obstacles_buf = nullptr;
     vx_buffer_h results_buf = nullptr;
 
-    CHECK(vx_buffer_create(
-        dev, robot_buf_size, VX_MEM_READ, &robots_buf));
+    vx_buffer_h motion_offsets_buf = nullptr;
+    vx_buffer_h pose_offsets_buf = nullptr;
+    vx_buffer_h features_buf = nullptr;
+    vx_buffer_h labels_buf = nullptr;
 
-    CHECK(vx_buffer_create(
-        dev, obstacle_buf_size, VX_MEM_READ, &obstacles_buf));
+    if (trace_mode) {
+        CHECK(vx_buffer_create(
+            dev,
+            trace.motion_offsets.size() * sizeof(uint64_t),
+            VX_MEM_READ,
+            &motion_offsets_buf));
 
-    CHECK(vx_buffer_create(
-        dev, results_buf_size, VX_MEM_WRITE, &results_buf));
+        CHECK(vx_buffer_create(
+            dev,
+            trace.pose_offsets.size() * sizeof(uint64_t),
+            VX_MEM_READ,
+            &pose_offsets_buf));
+
+        CHECK(vx_buffer_create(
+            dev,
+            trace.features.size() * sizeof(trace_feature_t),
+            VX_MEM_READ,
+            &features_buf));
+
+        CHECK(vx_buffer_create(
+            dev,
+            trace.labels.size() * sizeof(uint8_t),
+            VX_MEM_READ,
+            &labels_buf));
+
+        CHECK(vx_buffer_create(
+            dev,
+            results_buf_size,
+            VX_MEM_WRITE,
+            &results_buf));
+    } else {
+        CHECK(vx_buffer_create(
+            dev, robot_buf_size, VX_MEM_READ, &robots_buf));
+
+        CHECK(vx_buffer_create(
+            dev, obstacle_buf_size, VX_MEM_READ, &obstacles_buf));
+
+        CHECK(vx_buffer_create(
+            dev, results_buf_size, VX_MEM_WRITE, &results_buf));
+    }
 
     // ----- Load kernel -----
 
@@ -348,30 +511,76 @@ int main(int argc, char** argv) {
 
     kernel_arg_t kernel_arg{};
 
+    kernel_arg.mode =
+        trace_mode ? KERNEL_MODE_TRACE : KERNEL_MODE_AABB;
+
     kernel_arg.num_motions = num_motions;
     kernel_arg.poses_per_motion = poses_per_motion;
     kernel_arg.num_obstacles = num_obstacles;
 
-    CHECK(vx_buffer_address(
-        robots_buf, &kernel_arg.robot_boxes_addr));
+    if (trace_mode) {
+        CHECK(vx_buffer_address(
+            motion_offsets_buf, &kernel_arg.motion_offsets_addr));
 
-    CHECK(vx_buffer_address(
-        obstacles_buf, &kernel_arg.obstacle_boxes_addr));
+        CHECK(vx_buffer_address(
+            pose_offsets_buf, &kernel_arg.pose_offsets_addr));
 
-    CHECK(vx_buffer_address(
-        results_buf, &kernel_arg.results_addr));
+        CHECK(vx_buffer_address(
+            features_buf, &kernel_arg.features_addr));
+
+        CHECK(vx_buffer_address(
+            labels_buf, &kernel_arg.labels_addr));
+
+        CHECK(vx_buffer_address(
+            results_buf, &kernel_arg.trace_results_addr));
+    } else {
+        CHECK(vx_buffer_address(
+            robots_buf, &kernel_arg.robot_boxes_addr));
+
+        CHECK(vx_buffer_address(
+            obstacles_buf, &kernel_arg.obstacle_boxes_addr));
+
+        CHECK(vx_buffer_address(
+            results_buf, &kernel_arg.results_addr));
+    }
 
     // ----- Upload inputs -----
 
-    CHECK(vx_enqueue_write(
-        q, robots_buf, 0,
-        h_robots.data(), robot_buf_size,
-        0, nullptr, nullptr));
+    if (trace_mode) {
+        CHECK(vx_enqueue_write(
+            q, motion_offsets_buf, 0,
+            trace.motion_offsets.data(),
+            trace.motion_offsets.size() * sizeof(uint64_t),
+            0, nullptr, nullptr));
 
-    CHECK(vx_enqueue_write(
-        q, obstacles_buf, 0,
-        h_obstacles.data(), obstacle_buf_size,
-        0, nullptr, nullptr));
+        CHECK(vx_enqueue_write(
+            q, pose_offsets_buf, 0,
+            trace.pose_offsets.data(),
+            trace.pose_offsets.size() * sizeof(uint64_t),
+            0, nullptr, nullptr));
+
+        CHECK(vx_enqueue_write(
+            q, features_buf, 0,
+            trace.features.data(),
+            trace.features.size() * sizeof(trace_feature_t),
+            0, nullptr, nullptr));
+
+        CHECK(vx_enqueue_write(
+            q, labels_buf, 0,
+            trace.labels.data(),
+            trace.labels.size() * sizeof(uint8_t),
+            0, nullptr, nullptr));
+    } else {
+        CHECK(vx_enqueue_write(
+            q, robots_buf, 0,
+            h_robots.data(), robot_buf_size,
+            0, nullptr, nullptr));
+
+        CHECK(vx_enqueue_write(
+            q, obstacles_buf, 0,
+            h_obstacles.data(), obstacle_buf_size,
+            0, nullptr, nullptr));
+    }
 
     // ----- Launch kernel -----
 
@@ -398,8 +607,13 @@ int main(int argc, char** argv) {
 
     // ----- Read back results -----
 
+    void* h_result_data =
+        trace_mode
+            ? static_cast<void*>(h_trace_results.data())
+            : static_cast<void*>(h_results.data());
+
     CHECK(vx_enqueue_read(
-        q, h_results.data(), results_buf,
+        q, h_result_data, results_buf,
         0, results_buf_size,
         1, &launch_ev, &read_ev));
 
@@ -410,23 +624,68 @@ int main(int argc, char** argv) {
 
     int errors = 0;
 
-    for (uint32_t motion_id = 0;
-         motion_id < num_motions;
-         ++motion_id) {
+    if (trace_mode) {
+        uint64_t total_queries = 0;
+        uint64_t total_collisions = 0;
 
-        uint32_t expected =
-            cpu_motion_collision_check(
+        for (uint32_t motion_id = 0;
+             motion_id < num_motions;
+             ++motion_id) {
+
+            trace_result_t expected =
+                cpu_trace_motion_check(motion_id, trace);
+
+            const trace_result_t& actual =
+                h_trace_results[motion_id];
+
+            std::printf(
+                "Motion %5u: collision=%u/%u "
+                "queries=%u/%u checksum=%u/%u\n",
                 motion_id,
-                poses_per_motion,
-                h_robots,
-                h_obstacles);
+                expected.collision, actual.collision,
+                expected.query_count, actual.query_count,
+                expected.key_checksum, actual.key_checksum);
 
-        std::printf(
-            "Motion %3u: expected=%u actual=%u\n",
-            motion_id, expected, h_results[motion_id]);
+            if (actual.collision != expected.collision ||
+                actual.query_count != expected.query_count ||
+                actual.key_checksum != expected.key_checksum) {
+                ++errors;
+            }
 
-        if (h_results[motion_id] != expected) {
+            total_queries += actual.query_count;
+            total_collisions += actual.collision;
+        }
+
+        std::cout << "Trace verification summary:"
+                  << " motions=" << num_motions
+                  << " queries_processed=" << total_queries
+                  << " motions_with_collision=" << total_collisions
+                  << std::endl;
+
+        if (total_queries != trace.num_queries()) {
+            std::cerr << "Total processed query count does not match "
+                      << "the trace query count." << std::endl;
             ++errors;
+        }
+    } else {
+        for (uint32_t motion_id = 0;
+             motion_id < num_motions;
+             ++motion_id) {
+
+            uint32_t expected =
+                cpu_motion_collision_check(
+                    motion_id,
+                    poses_per_motion,
+                    h_robots,
+                    h_obstacles);
+
+            std::printf(
+                "Motion %3u: expected=%u actual=%u\n",
+                motion_id, expected, h_results[motion_id]);
+
+            if (h_results[motion_id] != expected) {
+                ++errors;
+            }
         }
     }
 
@@ -436,8 +695,16 @@ int main(int argc, char** argv) {
     vx_event_release(launch_ev);
 
     vx_buffer_release(results_buf);
-    vx_buffer_release(obstacles_buf);
-    vx_buffer_release(robots_buf);
+
+    if (trace_mode) {
+        vx_buffer_release(labels_buf);
+        vx_buffer_release(features_buf);
+        vx_buffer_release(pose_offsets_buf);
+        vx_buffer_release(motion_offsets_buf);
+    } else {
+        vx_buffer_release(obstacles_buf);
+        vx_buffer_release(robots_buf);
+    }
 
     vx_kernel_release(kern);
     vx_module_release(mod);

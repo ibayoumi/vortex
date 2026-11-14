@@ -5,7 +5,7 @@ PROJECT := collision_detection
 
 SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
 
-SRCS := $(SRC_DIR)/main.cpp
+SRCS := $(SRC_DIR)/main.cpp $(SRC_DIR)/trace_loader.cpp
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
