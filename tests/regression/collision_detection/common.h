@@ -15,7 +15,8 @@ typedef struct {
 
 // Arguments passed from the host to the GPU kernel.
 typedef struct {
-    uint32_t num_queries;
+    uint32_t num_motions;
+    uint32_t poses_per_motion;
     uint32_t num_obstacles;
     uint64_t robot_boxes_addr;
     uint64_t obstacle_boxes_addr;

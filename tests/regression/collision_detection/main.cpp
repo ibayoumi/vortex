@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <unistd.h>
 #include <vector>
 
@@ -20,29 +21,75 @@
 namespace {
 
 const char* kernel_file = "kernel.vxbin";
-uint32_t num_queries = 16;
+
+uint32_t num_motions = 16;
+uint32_t poses_per_motion = 8;
 uint32_t num_obstacles = 8;
+
+uint32_t parse_count(const char* value, const char* name) {
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(value, &end, 10);
+
+    if (value[0] == '-' ||
+        end == value ||
+        *end != '\0' ||
+        parsed == 0 ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "Invalid value for " << name << ": "
+                  << value << std::endl;
+        std::exit(1);
+    }
+
+    return static_cast<uint32_t>(parsed);
+}
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:o:k:h")) != -1) {
+
+    while ((c = getopt(argc, argv, "n:p:o:k:h")) != -1) {
         switch (c) {
-            case 'n': num_queries = std::atoi(optarg); break;
-            case 'o': num_obstacles = std::atoi(optarg); break;
-            case 'k': kernel_file = optarg; break;
+            case 'n':
+                num_motions = parse_count(optarg, "-n");
+                break;
+
+            case 'p':
+                poses_per_motion = parse_count(optarg, "-p");
+                break;
+
+            case 'o':
+                num_obstacles = parse_count(optarg, "-o");
+                break;
+
+            case 'k':
+                kernel_file = optarg;
+                break;
+
             case 'h':
-                std::cout << "Usage: [-k kernel] [-n queries] "
-                             "[-o obstacles] [-h]" << std::endl;
+                std::cout
+                    << "Usage: [-k kernel] [-n motions] "
+                    << "[-p poses_per_motion] [-o obstacles] [-h]"
+                    << std::endl;
                 std::exit(0);
+
             default:
-                std::cout << "Usage: [-k kernel] [-n queries] "
-                             "[-o obstacles] [-h]" << std::endl;
                 std::exit(1);
         }
     }
 
-    if (num_queries == 0 || num_obstacles == 0) {
-        std::cerr << "Number of queries and obstacles must be positive."
+    if (poses_per_motion < 3) {
+        std::cerr
+            << "At least 3 poses per motion are required for "
+            << "the intermediate/final collision test cases."
+            << std::endl;
+        std::exit(1);
+    }
+
+    uint64_t total_boxes =
+        static_cast<uint64_t>(num_motions) * poses_per_motion;
+
+    if (total_boxes > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "Total number of robot boxes exceeds the "
+                  << "32-bit kernel indexing limit."
                   << std::endl;
         std::exit(1);
     }
@@ -58,17 +105,172 @@ bool aabb_intersects(const aabb_t& a, const aabb_t& b) {
         (a.max_z >= b.min_z);
 }
 
-uint32_t cpu_collision_check(
-    const aabb_t& robot,
+uint32_t cpu_motion_collision_check(
+    uint32_t motion_id,
+    uint32_t poses_per_motion,
+    const std::vector<aabb_t>& robot_boxes,
     const std::vector<aabb_t>& obstacles) {
 
-    for (const auto& obstacle : obstacles) {
-        if (aabb_intersects(robot, obstacle)) {
-            return 1;
+    for (uint32_t pose_id = 0;
+         pose_id < poses_per_motion;
+         ++pose_id) {
+
+        uint32_t box_idx =
+            motion_id * poses_per_motion + pose_id;
+
+        const aabb_t& robot = robot_boxes[box_idx];
+
+        for (const auto& obstacle : obstacles) {
+            if (aabb_intersects(robot, obstacle)) {
+                return 1;
+            }
         }
     }
 
     return 0;
+}
+
+aabb_t make_box(
+    float min_x,
+    float min_y,
+    float min_z,
+    float max_x,
+    float max_y,
+    float max_z) {
+
+    return {
+        min_x, min_y, min_z,
+        max_x, max_y, max_z
+    };
+}
+
+// A clear pose placed between obstacle 0 and obstacle 1.
+aabb_t make_clear_pose() {
+    return make_box(
+        2.0f, -0.5f, -0.5f,
+        3.0f,  0.5f,  0.5f
+    );
+}
+
+// A colliding pose centered on the specified obstacle.
+aabb_t make_colliding_pose(uint32_t obstacle_id) {
+    float center_x = static_cast<float>(obstacle_id) * 10.0f;
+
+    return make_box(
+        center_x - 0.5f, -0.5f, -0.5f,
+        center_x + 0.5f,  0.5f,  0.5f
+    );
+}
+
+void generate_obstacles(std::vector<aabb_t>& obstacles) {
+    for (uint32_t j = 0; j < num_obstacles; ++j) {
+        float center_x = static_cast<float>(j) * 10.0f;
+
+        obstacles[j] = make_box(
+            center_x - 1.0f, -1.0f, -1.0f,
+            center_x + 1.0f,  1.0f,  1.0f
+        );
+    }
+}
+
+void generate_motions(std::vector<aabb_t>& robot_boxes) {
+    // Start every pose as collision-free.
+    for (auto& box : robot_boxes) {
+        box = make_clear_pose();
+    }
+
+    for (uint32_t motion_id = 0;
+         motion_id < num_motions;
+         ++motion_id) {
+
+        uint32_t base =
+            motion_id * poses_per_motion;
+
+        // Motion 0: collision at the first pose.
+        if (motion_id == 0) {
+            robot_boxes[base] = make_colliding_pose(0);
+
+        // Motion 1: remains clear.
+        } else if (motion_id == 1) {
+            // All poses remain clear.
+
+        // Motion 2: touches obstacle 0 at its maximum X face.
+        } else if (motion_id == 2) {
+            robot_boxes[base] = make_box(
+                 1.0f, -0.5f, -0.5f,
+                 2.0f,  0.5f,  0.5f
+            );
+
+        // Motion 3: small gap beyond obstacle 0's maximum X face.
+        } else if (motion_id == 3) {
+            robot_boxes[base] = make_box(
+                 1.001f, -0.5f, -0.5f,
+                 2.0f,    0.5f,  0.5f
+            );
+
+        // Motion 4: collision at an intermediate pose.
+        } else if (motion_id == 4) {
+            uint32_t collision_pose = poses_per_motion / 2;
+            robot_boxes[base + collision_pose] =
+                make_colliding_pose(0);
+
+        // Motion 5: collision at the final pose.
+        } else if (motion_id == 5) {
+            robot_boxes[base + poses_per_motion - 1] =
+                make_colliding_pose(0);
+
+        // Motion 6: collision after several clear poses.
+        } else if (motion_id == 6) {
+            uint32_t collision_pose = poses_per_motion - 2;
+            robot_boxes[base + collision_pose] =
+                make_colliding_pose(0);
+
+        // Motion 7: remains clear.
+        } else if (motion_id == 7) {
+            // All poses remain clear.
+
+        // Motion 8: robot box fully contained inside obstacle 0.
+        } else if (motion_id == 8) {
+            robot_boxes[base] = make_box(
+                -0.25f, -0.25f, -0.25f,
+                 0.25f,  0.25f,  0.25f
+            );
+
+        // Motion 9: robot box fully contains obstacle 0.
+        } else if (motion_id == 9) {
+            robot_boxes[base] = make_box(
+                -2.0f, -2.0f, -2.0f,
+                 2.0f,  2.0f,  2.0f
+            );
+
+        // Motion 10: touches obstacle 0 at its maximum Y face.
+        } else if (motion_id == 10) {
+            robot_boxes[base] = make_box(
+                -0.5f,  1.0f, -0.5f,
+                 0.5f,  2.0f,  0.5f
+            );
+
+        // Motion 11: small gap beyond obstacle 0's maximum Y face.
+        } else if (motion_id == 11) {
+            robot_boxes[base] = make_box(
+                -0.5f,  1.001f, -0.5f,
+                 0.5f,  2.0f,    0.5f
+            );
+
+        // Remaining motions: alternate between collision and clear.
+        } else {
+            if (motion_id % 2 == 0) {
+                uint32_t collision_pose =
+                    motion_id % poses_per_motion;
+
+                uint32_t obstacle_id =
+                    motion_id % num_obstacles;
+
+                robot_boxes[base + collision_pose] =
+                    make_colliding_pose(obstacle_id);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -76,100 +278,36 @@ uint32_t cpu_collision_check(
 int main(int argc, char** argv) {
     parse_args(argc, argv);
 
+    const uint64_t num_robot_boxes =
+        static_cast<uint64_t>(num_motions) * poses_per_motion;
+
     const uint64_t robot_buf_size =
-        static_cast<uint64_t>(num_queries) * sizeof(aabb_t);
+        num_robot_boxes * sizeof(aabb_t);
+
     const uint64_t obstacle_buf_size =
         static_cast<uint64_t>(num_obstacles) * sizeof(aabb_t);
+
     const uint64_t results_buf_size =
-        static_cast<uint64_t>(num_queries) * sizeof(uint32_t);
+        static_cast<uint64_t>(num_motions) * sizeof(uint32_t);
 
     std::cout << "collision_detection vortex2:"
-              << " queries=" << num_queries
+              << " motions=" << num_motions
+              << " poses_per_motion=" << poses_per_motion
               << " obstacles=" << num_obstacles
+              << " total_robot_boxes=" << num_robot_boxes
               << std::endl;
 
-    // ----- Generate deterministic input AABBs -----
+    // ----- Generate deterministic input data -----
 
-    std::vector<aabb_t> h_robots(num_queries);
+    std::vector<aabb_t> h_robots(
+        static_cast<size_t>(num_robot_boxes));
+
     std::vector<aabb_t> h_obstacles(num_obstacles);
-    std::vector<uint32_t> h_results(num_queries, 0);
 
-    // Obstacles are separated along the x-axis.
-    for (uint32_t j = 0; j < num_obstacles; ++j) {
-        float center_x = static_cast<float>(j) * 10.0f;
+    std::vector<uint32_t> h_results(num_motions, 0);
 
-        h_obstacles[j] = {
-            center_x - 1.0f, -1.0f, -1.0f,
-            center_x + 1.0f,  1.0f,  1.0f
-        };
-    }
-
-    // ----- Generate robot boxes with geometric edge cases -----
-
-    for (uint32_t i = 0; i < num_queries; ++i) {
-        if (i == 0) {
-            // Partial overlap with obstacle 0.
-            h_robots[i] = {
-                -0.5f, -0.5f, -0.5f,
-                 0.5f,  0.5f,  0.5f
-            };
-        } else if (i == 1) {
-            // Clearly separated from every obstacle.
-            h_robots[i] = {
-                 2.0f, -0.5f, -0.5f,
-                 3.0f,  0.5f,  0.5f
-            };
-        } else if (i == 2) {
-            // Touching obstacle 0 at its maximum X face.
-            h_robots[i] = {
-                 1.0f, -0.5f, -0.5f,
-                 2.0f,  0.5f,  0.5f
-            };
-        } else if (i == 3) {
-            // Small gap beyond obstacle 0's maximum X face.
-            h_robots[i] = {
-                 1.001f, -0.5f, -0.5f,
-                 2.0f,    0.5f,  0.5f
-            };
-        } else if (i == 4) {
-            // Robot box fully contained inside obstacle 0.
-            h_robots[i] = {
-                -0.25f, -0.25f, -0.25f,
-                 0.25f,  0.25f,  0.25f
-            };
-        } else if (i == 5) {
-            // Robot box fully contains obstacle 0.
-            h_robots[i] = {
-                -2.0f, -2.0f, -2.0f,
-                 2.0f,  2.0f,  2.0f
-            };
-        } else if (i == 6) {
-            // Touching obstacle 0 at its maximum Y face.
-            h_robots[i] = {
-                -0.5f,  1.0f, -0.5f,
-                 0.5f,  2.0f,  0.5f
-            };
-        } else if (i == 7) {
-            // Small gap beyond obstacle 0's maximum Y face.
-            h_robots[i] = {
-                -0.5f,  1.001f, -0.5f,
-                 0.5f,  2.0f,    0.5f
-            };
-        } else {
-            // Retain the alternating overlap/separation pattern.
-            float center_x =
-                static_cast<float>((i / 2) % num_obstacles) * 10.0f;
-
-            if (i % 2 != 0) {
-                center_x += 5.0f;
-            }
-
-            h_robots[i] = {
-                center_x - 0.5f, -0.5f, -0.5f,
-                center_x + 0.5f,  0.5f,  0.5f
-            };
-        }
-    }
+    generate_obstacles(h_obstacles);
+    generate_motions(h_robots);
 
     // ----- Open device and create queue -----
 
@@ -189,12 +327,14 @@ int main(int argc, char** argv) {
     vx_buffer_h obstacles_buf = nullptr;
     vx_buffer_h results_buf = nullptr;
 
-    CHECK(vx_buffer_create(dev, robot_buf_size,
-                           VX_MEM_READ, &robots_buf));
-    CHECK(vx_buffer_create(dev, obstacle_buf_size,
-                           VX_MEM_READ, &obstacles_buf));
-    CHECK(vx_buffer_create(dev, results_buf_size,
-                           VX_MEM_WRITE, &results_buf));
+    CHECK(vx_buffer_create(
+        dev, robot_buf_size, VX_MEM_READ, &robots_buf));
+
+    CHECK(vx_buffer_create(
+        dev, obstacle_buf_size, VX_MEM_READ, &obstacles_buf));
+
+    CHECK(vx_buffer_create(
+        dev, results_buf_size, VX_MEM_WRITE, &results_buf));
 
     // ----- Load kernel -----
 
@@ -207,31 +347,41 @@ int main(int argc, char** argv) {
     // ----- Set kernel arguments -----
 
     kernel_arg_t kernel_arg{};
-    kernel_arg.num_queries = num_queries;
+
+    kernel_arg.num_motions = num_motions;
+    kernel_arg.poses_per_motion = poses_per_motion;
     kernel_arg.num_obstacles = num_obstacles;
 
-    CHECK(vx_buffer_address(robots_buf,
-                            &kernel_arg.robot_boxes_addr));
-    CHECK(vx_buffer_address(obstacles_buf,
-                            &kernel_arg.obstacle_boxes_addr));
-    CHECK(vx_buffer_address(results_buf,
-                            &kernel_arg.results_addr));
+    CHECK(vx_buffer_address(
+        robots_buf, &kernel_arg.robot_boxes_addr));
 
-    // ----- Upload inputs and launch kernel -----
+    CHECK(vx_buffer_address(
+        obstacles_buf, &kernel_arg.obstacle_boxes_addr));
 
-    CHECK(vx_enqueue_write(q, robots_buf, 0,
-                           h_robots.data(), robot_buf_size,
-                           0, nullptr, nullptr));
+    CHECK(vx_buffer_address(
+        results_buf, &kernel_arg.results_addr));
 
-    CHECK(vx_enqueue_write(q, obstacles_buf, 0,
-                           h_obstacles.data(), obstacle_buf_size,
-                           0, nullptr, nullptr));
+    // ----- Upload inputs -----
+
+    CHECK(vx_enqueue_write(
+        q, robots_buf, 0,
+        h_robots.data(), robot_buf_size,
+        0, nullptr, nullptr));
+
+    CHECK(vx_enqueue_write(
+        q, obstacles_buf, 0,
+        h_obstacles.data(), obstacle_buf_size,
+        0, nullptr, nullptr));
+
+    // ----- Launch kernel -----
 
     uint32_t grid[1], block[1];
+
     CHECK(vx_device_max_occupancy_grid(
-        dev, 1, &num_queries, grid, block));
+        dev, 1, &num_motions, grid, block));
 
     vx_launch_info_t li{};
+
     li.struct_size = sizeof(li);
     li.kernel = kern;
     li.args_host = &kernel_arg;
@@ -243,29 +393,39 @@ int main(int argc, char** argv) {
     vx_event_h launch_ev = nullptr;
     vx_event_h read_ev = nullptr;
 
-    CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
+    CHECK(vx_enqueue_launch(
+        q, &li, 0, nullptr, &launch_ev));
 
-    // Readback depends on completion of the kernel launch.
-    CHECK(vx_enqueue_read(q, h_results.data(), results_buf,
-                          0, results_buf_size,
-                          1, &launch_ev, &read_ev));
+    // ----- Read back results -----
 
-    CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+    CHECK(vx_enqueue_read(
+        q, h_results.data(), results_buf,
+        0, results_buf_size,
+        1, &launch_ev, &read_ev));
+
+    CHECK(vx_event_wait_value(
+        read_ev, 1, VX_TIMEOUT_INFINITE));
 
     // ----- Verify GPU results against CPU reference -----
 
     int errors = 0;
 
-    for (uint32_t i = 0; i < num_queries; ++i) {
+    for (uint32_t motion_id = 0;
+         motion_id < num_motions;
+         ++motion_id) {
+
         uint32_t expected =
-            cpu_collision_check(h_robots[i], h_obstacles);
+            cpu_motion_collision_check(
+                motion_id,
+                poses_per_motion,
+                h_robots,
+                h_obstacles);
 
-        // Print every query's expected and actual collision flags.
         std::printf(
-            "Query %2u: expected=%u actual=%u\n",
-            i, expected, h_results[i]);
+            "Motion %3u: expected=%u actual=%u\n",
+            motion_id, expected, h_results[motion_id]);
 
-        if (h_results[i] != expected) {
+        if (h_results[motion_id] != expected) {
             ++errors;
         }
     }
