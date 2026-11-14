@@ -2,6 +2,7 @@
 #include "common.h"
 #include "trace_loader.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,14 @@ uint32_t num_motions = 16;
 uint32_t poses_per_motion = 8;
 uint32_t num_obstacles = 8;
 
+// COORD configuration.
+bool coord_mode = false;
+uint32_t coord_benchmark = 0;
+uint32_t coord_slots = 6;
+uint32_t coord_seed = 0;
+float coord_threshold = 1.0f;
+float coord_update_probability = 0.125f;
+
 uint32_t parse_count(const char* value, const char* name) {
     char* end = nullptr;
     unsigned long parsed = std::strtoul(value, &end, 10);
@@ -45,10 +54,24 @@ uint32_t parse_count(const char* value, const char* name) {
     return static_cast<uint32_t>(parsed);
 }
 
+float parse_float(const char* value, const char* name) {
+    char* end = nullptr;
+    float parsed = std::strtof(value, &end);
+
+    if (end == value || *end != '\0' ||
+        !std::isfinite(parsed)) {
+        std::cerr << "Invalid value for " << name
+                  << ": " << value << std::endl;
+        std::exit(1);
+    }
+
+    return parsed;
+}
+
 void parse_args(int argc, char** argv) {
     int c;
 
-    while ((c = getopt(argc, argv, "n:p:o:k:t:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:p:o:k:t:cb:w:s:u:r:h")) != -1) {
         switch (c) {
             case 'n':
                 num_motions = parse_count(optarg, "-n");
@@ -70,11 +93,37 @@ void parse_args(int argc, char** argv) {
                 trace_file = optarg;
                 break;
 
+            case 'c':
+                coord_mode = true;
+                break;
+
+            case 'b':
+                coord_benchmark = parse_count(optarg, "-b") - 1;
+                break;
+
+            case 'w':
+                coord_slots = parse_count(optarg, "-w");
+                break;
+
+            case 's':
+                coord_threshold = parse_float(optarg, "-s");
+                break;
+
+            case 'u':
+                coord_update_probability = parse_float(optarg, "-u");
+                break;
+
+            case 'r':
+                coord_seed = parse_count(optarg, "-r") - 1;
+                break;
+
             case 'h':
                 std::cout
                     << "Usage: [-k kernel] [-n motions] "
                     << "[-p poses_per_motion] [-o obstacles] "
-                    << "[-t trace_file] [-h]"
+                    << "[-t trace_file] [-c] [-b benchmark] "
+                    << "[-w slots] [-s threshold] "
+                    << "[-u update_probability] [-r seed] [-h]"
                     << std::endl;
                 std::exit(0);
 
@@ -88,6 +137,23 @@ void parse_args(int argc, char** argv) {
             << "At least 3 poses per motion are required for "
             << "the intermediate/final collision test cases."
             << std::endl;
+        std::exit(1);
+    }
+
+    if (coord_mode && trace_file == nullptr) {
+        std::cerr << "COORD mode requires a trace file (-t)."
+                  << std::endl;
+        std::exit(1);
+    }
+
+    if (coord_mode &&
+        (coord_threshold < 0.0f ||
+         coord_update_probability < 0.0f ||
+         coord_update_probability > 1.0f ||
+         coord_slots == 0 ||
+         coord_slots > COORD_MAX_SLOTS)) {
+        std::cerr << "Invalid COORD configuration."
+                  << std::endl;
         std::exit(1);
     }
 
@@ -182,7 +248,6 @@ void generate_obstacles(std::vector<aabb_t>& obstacles) {
 }
 
 void generate_motions(std::vector<aabb_t>& robot_boxes) {
-    // Start every pose as collision-free.
     for (auto& box : robot_boxes) {
         box = make_clear_pose();
     }
@@ -191,81 +256,55 @@ void generate_motions(std::vector<aabb_t>& robot_boxes) {
          motion_id < num_motions;
          ++motion_id) {
 
-        uint32_t base =
-            motion_id * poses_per_motion;
+        uint32_t base = motion_id * poses_per_motion;
 
-        // Motion 0: collision at the first pose.
         if (motion_id == 0) {
             robot_boxes[base] = make_colliding_pose(0);
-
-        // Motion 1: remains clear.
         } else if (motion_id == 1) {
             // All poses remain clear.
-
-        // Motion 2: touches obstacle 0 at its maximum X face.
         } else if (motion_id == 2) {
             robot_boxes[base] = make_box(
                  1.0f, -0.5f, -0.5f,
                  2.0f,  0.5f,  0.5f
             );
-
-        // Motion 3: small gap beyond obstacle 0's maximum X face.
         } else if (motion_id == 3) {
             robot_boxes[base] = make_box(
                  1.001f, -0.5f, -0.5f,
                  2.0f,    0.5f,  0.5f
             );
-
-        // Motion 4: collision at an intermediate pose.
         } else if (motion_id == 4) {
             uint32_t collision_pose = poses_per_motion / 2;
             robot_boxes[base + collision_pose] =
                 make_colliding_pose(0);
-
-        // Motion 5: collision at the final pose.
         } else if (motion_id == 5) {
             robot_boxes[base + poses_per_motion - 1] =
                 make_colliding_pose(0);
-
-        // Motion 6: collision after several clear poses.
         } else if (motion_id == 6) {
             uint32_t collision_pose = poses_per_motion - 2;
             robot_boxes[base + collision_pose] =
                 make_colliding_pose(0);
-
-        // Motion 7: remains clear.
         } else if (motion_id == 7) {
             // All poses remain clear.
-
-        // Motion 8: robot box fully contained inside obstacle 0.
         } else if (motion_id == 8) {
             robot_boxes[base] = make_box(
                 -0.25f, -0.25f, -0.25f,
                  0.25f,  0.25f,  0.25f
             );
-
-        // Motion 9: robot box fully contains obstacle 0.
         } else if (motion_id == 9) {
             robot_boxes[base] = make_box(
                 -2.0f, -2.0f, -2.0f,
                  2.0f,  2.0f,  2.0f
             );
-
-        // Motion 10: touches obstacle 0 at its maximum Y face.
         } else if (motion_id == 10) {
             robot_boxes[base] = make_box(
                 -0.5f,  1.0f, -0.5f,
                  0.5f,  2.0f,  0.5f
             );
-
-        // Motion 11: small gap beyond obstacle 0's maximum Y face.
         } else if (motion_id == 11) {
             robot_boxes[base] = make_box(
                 -0.5f,  1.001f, -0.5f,
                  0.5f,  2.0f,    0.5f
             );
-
-        // Remaining motions: alternate between collision and clear.
         } else {
             if (motion_id % 2 == 0) {
                 uint32_t collision_pose =
@@ -344,14 +383,128 @@ trace_result_t cpu_trace_motion_check(
 
 } // namespace
 
+
+void build_coord_ordered_queries(
+    const mpnet_trace_t& trace,
+    uint32_t benchmark_index,
+    uint32_t motion_limit,
+    uint64_t& first_motion,
+    std::vector<uint64_t>& ordered_query_offsets,
+    std::vector<uint64_t>& ordered_query_ids) {
+
+    if (benchmark_index >= trace.benchmark_ids.size()) {
+        std::cerr << "Invalid COORD benchmark index: "
+                  << benchmark_index << std::endl;
+        std::exit(1);
+    }
+
+    const uint64_t benchmark_begin =
+        trace.benchmark_offsets[benchmark_index];
+
+    const uint64_t benchmark_end =
+        trace.benchmark_offsets[benchmark_index + 1];
+
+    const uint64_t available_motions =
+        benchmark_end - benchmark_begin;
+
+    if (available_motions == 0) {
+        std::cerr << "Selected benchmark contains no motions."
+                  << std::endl;
+        std::exit(1);
+    }
+
+    const uint64_t selected_motions =
+        available_motions < motion_limit
+            ? available_motions
+            : motion_limit;
+
+    first_motion = benchmark_begin;
+
+    static const uint32_t pose_offsets_order[] = {
+        0, 4, 2, 6, 1, 5, 3, 7
+    };
+
+    ordered_query_offsets.clear();
+    ordered_query_ids.clear();
+
+    ordered_query_offsets.push_back(0);
+
+    for (uint64_t local_motion = 0;
+         local_motion < selected_motions;
+         ++local_motion) {
+
+        const uint64_t motion_id =
+            benchmark_begin + local_motion;
+
+        const uint64_t first_pose =
+            trace.motion_offsets[motion_id];
+
+        const uint64_t last_pose =
+            trace.motion_offsets[motion_id + 1];
+
+        const uint64_t num_poses =
+            last_pose - first_pose;
+
+        if (num_poses == 0) {
+            std::cerr << "Motion " << motion_id
+                      << " contains no poses." << std::endl;
+            std::exit(1);
+        }
+
+        // Process the final pose first.
+        const uint64_t final_pose = last_pose - 1;
+
+        for (uint64_t query_id = trace.pose_offsets[final_pose];
+             query_id < trace.pose_offsets[final_pose + 1];
+             ++query_id) {
+            ordered_query_ids.push_back(query_id);
+        }
+
+        // Process the remaining poses in csp_rearrange order.
+        for (uint32_t i = 0; i < 8; ++i) {
+            for (uint64_t j = pose_offsets_order[i];
+                 j < num_poses - 1;
+                 j += 8) {
+
+                const uint64_t pose_id = first_pose + j;
+
+                for (uint64_t query_id = trace.pose_offsets[pose_id];
+                     query_id < trace.pose_offsets[pose_id + 1];
+                     ++query_id) {
+                    ordered_query_ids.push_back(query_id);
+                }
+            }
+        }
+
+        ordered_query_offsets.push_back(
+            ordered_query_ids.size());
+    }
+
+    std::cout << "COORD ordered-query workload:" << std::endl;
+    std::cout << "  Benchmark index: " << benchmark_index << std::endl;
+    std::cout << "  Benchmark ID:    "
+              << trace.benchmark_ids[benchmark_index] << std::endl;
+    std::cout << "  First motion:    " << first_motion << std::endl;
+    std::cout << "  Motions:         " << selected_motions << std::endl;
+    std::cout << "  Ordered queries: "
+              << ordered_query_ids.size() << std::endl;
+}
+
 int main(int argc, char** argv) {
     parse_args(argc, argv);
+
+    const uint32_t requested_num_motions = num_motions;
 
     const bool trace_mode = (trace_file != nullptr);
 
     // ----- Optionally load the MPNet trace -----
 
     mpnet_trace_t trace;
+
+    uint64_t coord_first_motion = 0;
+
+    std::vector<uint64_t> h_ordered_query_offsets;
+    std::vector<uint64_t> h_ordered_query_ids;
 
     if (trace_mode) {
         std::string error;
@@ -371,6 +524,19 @@ int main(int argc, char** argv) {
         }
 
         num_motions = static_cast<uint32_t>(trace.num_motions());
+
+        if (coord_mode) {
+            build_coord_ordered_queries(
+                trace,
+                coord_benchmark,
+                requested_num_motions,
+                coord_first_motion,
+                h_ordered_query_offsets,
+                h_ordered_query_ids);
+
+            num_motions =
+                static_cast<uint32_t>(h_ordered_query_offsets.size() - 1);
+        }
 
         uint64_t collision_count = 0;
         for (uint8_t label : trace.labels) {
@@ -404,14 +570,19 @@ int main(int argc, char** argv) {
 
     const uint64_t results_buf_size =
         static_cast<uint64_t>(num_motions) *
-        (trace_mode ? sizeof(trace_result_t) : sizeof(uint32_t));
+        (coord_mode
+            ? sizeof(coord_result_t)
+            : (trace_mode ? sizeof(trace_result_t) : sizeof(uint32_t)));
 
     std::vector<aabb_t> h_robots;
     std::vector<aabb_t> h_obstacles;
     std::vector<uint32_t> h_results;
     std::vector<trace_result_t> h_trace_results;
+    std::vector<coord_result_t> h_coord_results;
 
-    if (trace_mode) {
+    if (coord_mode) {
+        h_coord_results.resize(num_motions);
+    } else if (trace_mode) {
         h_trace_results.resize(num_motions);
 
         std::cout << "Trace replay workload:"
@@ -458,6 +629,10 @@ int main(int argc, char** argv) {
     vx_buffer_h features_buf = nullptr;
     vx_buffer_h labels_buf = nullptr;
 
+    vx_buffer_h ordered_query_offsets_buf = nullptr;
+    vx_buffer_h ordered_query_ids_buf = nullptr;
+    vx_buffer_h coord_cht_buf = nullptr;
+
     if (trace_mode) {
         CHECK(vx_buffer_create(
             dev,
@@ -482,6 +657,26 @@ int main(int argc, char** argv) {
             trace.labels.size() * sizeof(uint8_t),
             VX_MEM_READ,
             &labels_buf));
+
+        if (coord_mode) {
+            CHECK(vx_buffer_create(
+                dev,
+                h_ordered_query_offsets.size() * sizeof(uint64_t),
+                VX_MEM_READ,
+                &ordered_query_offsets_buf));
+
+            CHECK(vx_buffer_create(
+                dev,
+                h_ordered_query_ids.size() * sizeof(uint64_t),
+                VX_MEM_READ,
+                &ordered_query_ids_buf));
+
+            CHECK(vx_buffer_create(
+                dev,
+                COORD_CHT_ENTRIES * sizeof(coord_cht_entry_t),
+                VX_MEM_READ | VX_MEM_WRITE,
+                &coord_cht_buf));
+        }
 
         CHECK(vx_buffer_create(
             dev,
@@ -512,7 +707,9 @@ int main(int argc, char** argv) {
     kernel_arg_t kernel_arg{};
 
     kernel_arg.mode =
-        trace_mode ? KERNEL_MODE_TRACE : KERNEL_MODE_AABB;
+        coord_mode
+            ? KERNEL_MODE_COORD
+            : (trace_mode ? KERNEL_MODE_TRACE : KERNEL_MODE_AABB);
 
     kernel_arg.num_motions = num_motions;
     kernel_arg.poses_per_motion = poses_per_motion;
@@ -531,8 +728,38 @@ int main(int argc, char** argv) {
         CHECK(vx_buffer_address(
             labels_buf, &kernel_arg.labels_addr));
 
-        CHECK(vx_buffer_address(
-            results_buf, &kernel_arg.trace_results_addr));
+        if (coord_mode) {
+            CHECK(vx_buffer_address(
+                ordered_query_offsets_buf,
+                &kernel_arg.ordered_query_offsets_addr));
+
+            CHECK(vx_buffer_address(
+                ordered_query_ids_buf,
+                &kernel_arg.ordered_query_ids_addr));
+
+            CHECK(vx_buffer_address(
+                coord_cht_buf,
+                &kernel_arg.coord_cht_addr));
+
+            CHECK(vx_buffer_address(
+                results_buf,
+                &kernel_arg.coord_results_addr));
+
+            kernel_arg.coord_slots = coord_slots;
+            kernel_arg.coord_seed = coord_seed;
+            kernel_arg.coord_threshold = coord_threshold;
+            kernel_arg.coord_update_probability =
+                coord_update_probability;
+            kernel_arg.coord_num_motions = num_motions;
+
+            kernel_arg.coord_update_threshold =
+                static_cast<uint64_t>(
+                    static_cast<double>(coord_update_probability) *
+                    9007199254740992.0);
+        } else {
+            CHECK(vx_buffer_address(
+                results_buf, &kernel_arg.trace_results_addr));
+        }
     } else {
         CHECK(vx_buffer_address(
             robots_buf, &kernel_arg.robot_boxes_addr));
@@ -570,6 +797,20 @@ int main(int argc, char** argv) {
             trace.labels.data(),
             trace.labels.size() * sizeof(uint8_t),
             0, nullptr, nullptr));
+
+        if (coord_mode) {
+            CHECK(vx_enqueue_write(
+                q, ordered_query_offsets_buf, 0,
+                h_ordered_query_offsets.data(),
+                h_ordered_query_offsets.size() * sizeof(uint64_t),
+                0, nullptr, nullptr));
+
+            CHECK(vx_enqueue_write(
+                q, ordered_query_ids_buf, 0,
+                h_ordered_query_ids.data(),
+                h_ordered_query_ids.size() * sizeof(uint64_t),
+                0, nullptr, nullptr));
+        }
     } else {
         CHECK(vx_enqueue_write(
             q, robots_buf, 0,
@@ -586,8 +827,10 @@ int main(int argc, char** argv) {
 
     uint32_t grid[1], block[1];
 
+    uint32_t launch_work_items = coord_mode ? 1 : num_motions;
+
     CHECK(vx_device_max_occupancy_grid(
-        dev, 1, &num_motions, grid, block));
+        dev, 1, &launch_work_items, grid, block));
 
     vx_launch_info_t li{};
 
@@ -608,9 +851,11 @@ int main(int argc, char** argv) {
     // ----- Read back results -----
 
     void* h_result_data =
-        trace_mode
-            ? static_cast<void*>(h_trace_results.data())
-            : static_cast<void*>(h_results.data());
+        coord_mode
+            ? static_cast<void*>(h_coord_results.data())
+            : (trace_mode
+                ? static_cast<void*>(h_trace_results.data())
+                : static_cast<void*>(h_results.data()));
 
     CHECK(vx_enqueue_read(
         q, h_result_data, results_buf,
@@ -624,7 +869,63 @@ int main(int argc, char** argv) {
 
     int errors = 0;
 
-    if (trace_mode) {
+    if (coord_mode) {
+        uint64_t total_queries = 0;
+        uint64_t total_cycles = 0;
+        uint64_t total_collisions = 0;
+        uint64_t total_attempts = 0;
+        uint64_t total_enqueued = 0;
+        double total_completed_predictions = 0.0;
+        uint64_t total_weighted_work_units = 0;
+
+        for (uint32_t motion_id = 0;
+             motion_id < num_motions;
+             ++motion_id) {
+
+            const coord_result_t& actual =
+                h_coord_results[motion_id];
+
+            std::printf(
+                "Motion %3u: cycles=%u collision=%u queries=%u "
+                "attempts=%u enqueued=%u completed=%.6f weighted=%.6f\n",
+                motion_id,
+                actual.cycles,
+                actual.collision,
+                actual.num_queries,
+                actual.classification_attempts,
+                actual.queries_enqueued,
+                actual.completed_predictions,
+                static_cast<double>(actual.weighted_prediction_work_units) / 400.0);
+
+            total_queries += actual.num_queries;
+            total_cycles += actual.cycles;
+            total_collisions += actual.collision;
+            total_attempts += actual.classification_attempts;
+            total_enqueued += actual.queries_enqueued;
+            total_completed_predictions +=
+                actual.completed_predictions;
+            total_weighted_work_units +=
+                actual.weighted_prediction_work_units;
+        }
+
+        std::cout << "COORD GPU results (CPU comparison pending):"
+                  << " motions=" << num_motions
+                  << " queries=" << total_queries
+                  << " collisions=" << total_collisions
+                  << " avg_cycles="
+                  << static_cast<double>(total_cycles) / num_motions
+                  << " avg_completed="
+                  << total_completed_predictions / num_motions
+                  << " avg_weighted_work="
+                  << static_cast<double>(total_weighted_work_units) /
+                         (400.0 * num_motions)
+                  << " avg_attempts="
+                  << static_cast<double>(total_attempts) / num_motions
+                  << " avg_enqueued="
+                  << static_cast<double>(total_enqueued) / num_motions
+                  << std::endl;
+
+    } else if (trace_mode) {
         uint64_t total_queries = 0;
         uint64_t total_collisions = 0;
 
@@ -662,7 +963,7 @@ int main(int argc, char** argv) {
                   << " motions_with_collision=" << total_collisions
                   << std::endl;
 
-        if (total_queries != trace.num_queries()) {
+        if (!coord_mode && total_queries != trace.num_queries()) {
             std::cerr << "Total processed query count does not match "
                       << "the trace query count." << std::endl;
             ++errors;
@@ -697,6 +998,12 @@ int main(int argc, char** argv) {
     vx_buffer_release(results_buf);
 
     if (trace_mode) {
+        if (coord_mode) {
+            vx_buffer_release(coord_cht_buf);
+            vx_buffer_release(ordered_query_ids_buf);
+            vx_buffer_release(ordered_query_offsets_buf);
+        }
+
         vx_buffer_release(labels_buf);
         vx_buffer_release(features_buf);
         vx_buffer_release(pose_offsets_buf);
@@ -719,6 +1026,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "PASSED!" << std::endl;
+    if (coord_mode) {
+        std::cout
+            << "COORD execution completed; CPU comparison is pending."
+            << std::endl;
+    } else {
+        std::cout << "PASSED!" << std::endl;
+    }
+
     return 0;
 }
