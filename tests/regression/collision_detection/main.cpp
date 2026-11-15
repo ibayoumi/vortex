@@ -24,6 +24,7 @@ namespace {
 
 const char* kernel_file = "kernel.vxbin";
 const char* trace_file = nullptr;
+bool geometry_mode = false;
 
 uint32_t num_motions = 16;
 uint32_t poses_per_motion = 8;
@@ -73,7 +74,7 @@ float parse_float(const char* value, const char* name) {
 void parse_args(int argc, char** argv) {
     int c;
 
-    while ((c = getopt(argc, argv, "n:p:o:k:t:cab:w:s:u:r:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:p:o:k:t:gcab:w:s:u:r:h")) != -1) {
         switch (c) {
             case 'n':
                 num_motions = parse_count(optarg, "-n");
@@ -93,6 +94,10 @@ void parse_args(int argc, char** argv) {
 
             case 't':
                 trace_file = optarg;
+                break;
+
+            case 'g':
+                geometry_mode = true;
                 break;
 
             case 'c':
@@ -128,7 +133,7 @@ void parse_args(int argc, char** argv) {
                 std::cout
                     << "Usage: [-k kernel] [-n motions] "
                     << "[-p poses_per_motion] [-o obstacles] "
-                    << "[-t trace_file] [-c] [-a | -b benchmark] "
+                    << "[-t trace_file] [-g] [-c] [-a | -b benchmark] "
                     << "[-w slots] [-s threshold] "
                     << "[-u update_probability] [-r seed] [-h]"
                     << std::endl;
@@ -139,10 +144,21 @@ void parse_args(int argc, char** argv) {
         }
     }
 
-    if (trace_file == nullptr && poses_per_motion < 3) {
+    if (!geometry_mode &&
+        trace_file == nullptr &&
+        poses_per_motion < 3) {
         std::cerr
             << "At least 3 poses per motion are required for "
             << "the intermediate/final collision test cases."
+            << std::endl;
+        std::exit(1);
+    }
+
+    if (geometry_mode &&
+        (trace_file != nullptr || coord_mode)) {
+        std::cerr
+            << "Geometry mode (-g) cannot be combined with "
+            << "TRACE (-t) or COORD (-c)."
             << std::endl;
         std::exit(1);
     }
@@ -179,7 +195,8 @@ void parse_args(int argc, char** argv) {
     uint64_t total_boxes =
         static_cast<uint64_t>(num_motions) * poses_per_motion;
 
-    if (trace_file == nullptr &&
+    if (!geometry_mode &&
+        trace_file == nullptr &&
         total_boxes > std::numeric_limits<uint32_t>::max()) {
         std::cerr << "Total number of robot boxes exceeds the "
                   << "32-bit kernel indexing limit."
@@ -549,8 +566,18 @@ void build_coord_ordered_queries(
               << ordered_query_ids.size() << std::endl;
 }
 
+int run_geometry_mode(
+    const char* kernel_file,
+    uint32_t num_motions,
+    uint32_t num_obstacles);
+
 int main(int argc, char** argv) {
     parse_args(argc, argv);
+
+    if (geometry_mode) {
+        return run_geometry_mode(
+            kernel_file, num_motions, num_obstacles);
+    }
 
     const uint32_t requested_num_motions = num_motions;
 

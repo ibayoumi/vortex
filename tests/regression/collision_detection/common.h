@@ -4,9 +4,13 @@
 #include <stdint.h>
 
 // Workload modes.
-#define KERNEL_MODE_AABB  0
-#define KERNEL_MODE_TRACE 1
-#define KERNEL_MODE_COORD 2
+#define KERNEL_MODE_AABB     0
+#define KERNEL_MODE_TRACE    1
+#define KERNEL_MODE_COORD    2
+#define KERNEL_MODE_GEOMETRY 3
+
+// Jaco geometry workload constants.
+#define GEOMETRY_NUM_LINKS 7
 
 // COORD scheduler constants.
 #define COORD_CHT_ENTRIES 4913
@@ -31,6 +35,20 @@ typedef struct {
     float y;
     float z;
 } trace_feature_t;
+
+// Oriented bounding box.
+// Rotation is a row-major 3x3 matrix whose columns are the local axes.
+typedef struct {
+    float center[3];
+    float half_extents[3];
+    float rotation[9];
+} obb_t;
+
+// Per-motion result from the geometry workload.
+typedef struct {
+    uint32_t collision;
+    uint32_t link_collision_mask;
+} geometry_result_t;
 
 // Per-motion result produced by the trace-replay kernel.
 typedef struct {
@@ -91,6 +109,11 @@ typedef struct {
     uint64_t ordered_query_ids_addr;
     uint64_t coord_cht_addr;
     uint64_t coord_results_addr;
+
+    // Jaco geometry workload buffers.
+    uint64_t obbs_addr;
+    uint64_t geometry_obstacles_addr;
+    uint64_t geometry_results_addr;
 } kernel_arg_t;
 
 #endif

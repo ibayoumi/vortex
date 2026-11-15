@@ -34,6 +34,118 @@ static inline uint32_t get_feature_key(
         quantize_feature(feature.z));
 }
 
+
+// -----------------------------------------------------------------------------
+// OBB-versus-AABB intersection using the separating-axis theorem.
+// OBB rotation is row-major, with local axes stored in its columns.
+// Touching boxes are considered intersecting.
+// -----------------------------------------------------------------------------
+
+static inline float abs_float(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+static __attribute__((noinline)) bool obb_aabb_intersects(
+    const obb_t& obb,
+    const aabb_t& aabb) {
+
+    const float epsilon = 1.0e-6f;
+
+    const float b_center[3] = {
+        0.5f * (aabb.min_x + aabb.max_x),
+        0.5f * (aabb.min_y + aabb.max_y),
+        0.5f * (aabb.min_z + aabb.max_z)
+    };
+
+    const float b_extent[3] = {
+        0.5f * (aabb.max_x - aabb.min_x),
+        0.5f * (aabb.max_y - aabb.min_y),
+        0.5f * (aabb.max_z - aabb.min_z)
+    };
+
+    // R[i][j] is the dot product of OBB axis i and AABB axis j.
+    float rotation[3][3];
+    float abs_rotation[3][3];
+
+    for (uint32_t i = 0; i < 3; ++i) {
+        for (uint32_t j = 0; j < 3; ++j) {
+            rotation[i][j] = obb.rotation[j * 3 + i];
+            abs_rotation[i][j] =
+                abs_float(rotation[i][j]) + epsilon;
+        }
+    }
+
+    const float displacement[3] = {
+        b_center[0] - obb.center[0],
+        b_center[1] - obb.center[1],
+        b_center[2] - obb.center[2]
+    };
+
+    // Express center displacement in the OBB coordinate frame.
+    float t[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+        t[i] =
+            displacement[0] * rotation[i][0] +
+            displacement[1] * rotation[i][1] +
+            displacement[2] * rotation[i][2];
+    }
+
+    // Test the three OBB face normals.
+    for (uint32_t i = 0; i < 3; ++i) {
+        const float radius_b =
+            b_extent[0] * abs_rotation[i][0] +
+            b_extent[1] * abs_rotation[i][1] +
+            b_extent[2] * abs_rotation[i][2];
+
+        if (abs_float(t[i]) > obb.half_extents[i] + radius_b) {
+            return false;
+        }
+    }
+
+    // Test the three AABB face normals.
+    for (uint32_t j = 0; j < 3; ++j) {
+        const float projected_center = abs_float(displacement[j]);
+
+        const float radius_a =
+            obb.half_extents[0] * abs_rotation[0][j] +
+            obb.half_extents[1] * abs_rotation[1][j] +
+            obb.half_extents[2] * abs_rotation[2][j];
+
+        if (projected_center > b_extent[j] + radius_a) {
+            return false;
+        }
+    }
+
+    // Test the nine cross-product axes: OBB_i x AABB_j.
+    for (uint32_t i = 0; i < 3; ++i) {
+        const uint32_t i1 = (i + 1) % 3;
+        const uint32_t i2 = (i + 2) % 3;
+
+        for (uint32_t j = 0; j < 3; ++j) {
+            const uint32_t j1 = (j + 1) % 3;
+            const uint32_t j2 = (j + 2) % 3;
+
+            const float radius_a =
+                obb.half_extents[i1] * abs_rotation[i2][j] +
+                obb.half_extents[i2] * abs_rotation[i1][j];
+
+            const float radius_b =
+                b_extent[j1] * abs_rotation[i][j2] +
+                b_extent[j2] * abs_rotation[i][j1];
+
+            const float projected_center = abs_float(
+                t[i2] * rotation[i1][j] -
+                t[i1] * rotation[i2][j]);
+
+            if (projected_center > radius_a + radius_b) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // -----------------------------------------------------------------------------
 // Python-compatible MT19937 random number generator
 //
@@ -523,6 +635,56 @@ static inline coord_result_t coord_simulate_motion(
 // Main kernel
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Jaco geometry workload
+// -----------------------------------------------------------------------------
+
+static __attribute__((noinline)) void geometry_mode(
+    kernel_arg_t* __UNIFORM__ arg,
+    uint32_t motion_id) {
+
+    if (motion_id >= arg->num_motions) {
+        return;
+    }
+
+    auto obbs =
+        reinterpret_cast<const obb_t*>(arg->obbs_addr);
+
+    auto obstacles =
+        reinterpret_cast<const aabb_t*>(
+            arg->geometry_obstacles_addr);
+
+    auto results =
+        reinterpret_cast<geometry_result_t*>(
+            arg->geometry_results_addr);
+
+    uint32_t link_collision_mask = 0;
+
+    for (uint32_t link = 0;
+         link < GEOMETRY_NUM_LINKS;
+         ++link) {
+
+        const obb_t& robot_link =
+            obbs[motion_id * GEOMETRY_NUM_LINKS + link];
+
+        for (uint32_t obstacle = 0;
+             obstacle < arg->num_obstacles;
+             ++obstacle) {
+
+            if (obb_aabb_intersects(
+                    robot_link, obstacles[obstacle])) {
+                link_collision_mask |= (1u << link);
+                break;
+            }
+        }
+    }
+
+    results[motion_id].link_collision_mask =
+        link_collision_mask;
+    results[motion_id].collision =
+        (link_collision_mask != 0) ? 1u : 0u;
+}
+
 __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
     uint32_t motion_id =
         blockIdx.x * blockDim.x + threadIdx.x;
@@ -732,4 +894,10 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
                     arg->coord_update_threshold);
         }
     }
+
+    if (arg->mode == KERNEL_MODE_GEOMETRY) {
+        geometry_mode(arg, motion_id);
+        return;
+    }
+
 }
