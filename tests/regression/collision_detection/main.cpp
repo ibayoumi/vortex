@@ -31,6 +31,8 @@ uint32_t num_obstacles = 8;
 
 // COORD configuration.
 bool coord_mode = false;
+bool coord_all_benchmarks = false;
+bool coord_benchmark_specified = false;
 uint32_t coord_benchmark = 0;
 uint32_t coord_slots = 6;
 uint32_t coord_seed = 0;
@@ -71,7 +73,7 @@ float parse_float(const char* value, const char* name) {
 void parse_args(int argc, char** argv) {
     int c;
 
-    while ((c = getopt(argc, argv, "n:p:o:k:t:cb:w:s:u:r:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:p:o:k:t:cab:w:s:u:r:h")) != -1) {
         switch (c) {
             case 'n':
                 num_motions = parse_count(optarg, "-n");
@@ -97,8 +99,13 @@ void parse_args(int argc, char** argv) {
                 coord_mode = true;
                 break;
 
+            case 'a':
+                coord_all_benchmarks = true;
+                break;
+
             case 'b':
                 coord_benchmark = parse_count(optarg, "-b") - 1;
+                coord_benchmark_specified = true;
                 break;
 
             case 'w':
@@ -121,7 +128,7 @@ void parse_args(int argc, char** argv) {
                 std::cout
                     << "Usage: [-k kernel] [-n motions] "
                     << "[-p poses_per_motion] [-o obstacles] "
-                    << "[-t trace_file] [-c] [-b benchmark] "
+                    << "[-t trace_file] [-c] [-a | -b benchmark] "
                     << "[-w slots] [-s threshold] "
                     << "[-u update_probability] [-r seed] [-h]"
                     << std::endl;
@@ -142,6 +149,18 @@ void parse_args(int argc, char** argv) {
 
     if (coord_mode && trace_file == nullptr) {
         std::cerr << "COORD mode requires a trace file (-t)."
+                  << std::endl;
+        std::exit(1);
+    }
+
+    if (coord_all_benchmarks && !coord_mode) {
+        std::cerr << "Option -a requires COORD mode (-c)."
+                  << std::endl;
+        std::exit(1);
+    }
+
+    if (coord_all_benchmarks && coord_benchmark_specified) {
+        std::cerr << "Use either -a or -b, not both."
                   << std::endl;
         std::exit(1);
     }
@@ -386,39 +405,20 @@ trace_result_t cpu_trace_motion_check(
 
 void build_coord_ordered_queries(
     const mpnet_trace_t& trace,
+    bool all_benchmarks,
     uint32_t benchmark_index,
     uint32_t motion_limit,
     uint64_t& first_motion,
     std::vector<uint64_t>& ordered_query_offsets,
-    std::vector<uint64_t>& ordered_query_ids) {
+    std::vector<uint64_t>& ordered_query_ids,
+    std::vector<uint64_t>& benchmark_motion_offsets) {
 
-    if (benchmark_index >= trace.benchmark_ids.size()) {
+    if (!all_benchmarks &&
+        benchmark_index >= trace.benchmark_ids.size()) {
         std::cerr << "Invalid COORD benchmark index: "
                   << benchmark_index << std::endl;
         std::exit(1);
     }
-
-    const uint64_t benchmark_begin =
-        trace.benchmark_offsets[benchmark_index];
-
-    const uint64_t benchmark_end =
-        trace.benchmark_offsets[benchmark_index + 1];
-
-    const uint64_t available_motions =
-        benchmark_end - benchmark_begin;
-
-    if (available_motions == 0) {
-        std::cerr << "Selected benchmark contains no motions."
-                  << std::endl;
-        std::exit(1);
-    }
-
-    const uint64_t selected_motions =
-        available_motions < motion_limit
-            ? available_motions
-            : motion_limit;
-
-    first_motion = benchmark_begin;
 
     static const uint32_t pose_offsets_order[] = {
         0, 4, 2, 6, 1, 5, 3, 7
@@ -426,66 +426,125 @@ void build_coord_ordered_queries(
 
     ordered_query_offsets.clear();
     ordered_query_ids.clear();
+    benchmark_motion_offsets.clear();
 
     ordered_query_offsets.push_back(0);
 
-    for (uint64_t local_motion = 0;
-         local_motion < selected_motions;
-         ++local_motion) {
+    const uint32_t first_benchmark =
+        all_benchmarks ? 0 : benchmark_index;
 
-        const uint64_t motion_id =
-            benchmark_begin + local_motion;
+    const uint32_t end_benchmark =
+        all_benchmarks
+            ? static_cast<uint32_t>(trace.benchmark_ids.size())
+            : benchmark_index + 1;
 
-        const uint64_t first_pose =
-            trace.motion_offsets[motion_id];
+    uint64_t selected_total = 0;
+    first_motion = 0;
 
-        const uint64_t last_pose =
-            trace.motion_offsets[motion_id + 1];
+    for (uint32_t b = first_benchmark;
+         b < end_benchmark && selected_total < motion_limit;
+         ++b) {
 
-        const uint64_t num_poses =
-            last_pose - first_pose;
+        const uint64_t benchmark_begin =
+            trace.benchmark_offsets[b];
 
-        if (num_poses == 0) {
-            std::cerr << "Motion " << motion_id
-                      << " contains no poses." << std::endl;
-            std::exit(1);
+        const uint64_t benchmark_end =
+            trace.benchmark_offsets[b + 1];
+
+        const uint64_t available_motions =
+            benchmark_end - benchmark_begin;
+
+        const uint64_t remaining_limit =
+            motion_limit - selected_total;
+
+        const uint64_t selected_motions =
+            available_motions < remaining_limit
+                ? available_motions
+                : remaining_limit;
+
+        if (selected_motions == 0) {
+            continue;
         }
 
-        // Process the final pose first.
-        const uint64_t final_pose = last_pose - 1;
-
-        for (uint64_t query_id = trace.pose_offsets[final_pose];
-             query_id < trace.pose_offsets[final_pose + 1];
-             ++query_id) {
-            ordered_query_ids.push_back(query_id);
+        if (selected_total == 0) {
+            first_motion = benchmark_begin;
         }
 
-        // Process the remaining poses in csp_rearrange order.
-        for (uint32_t i = 0; i < 8; ++i) {
-            for (uint64_t j = pose_offsets_order[i];
-                 j < num_poses - 1;
-                 j += 8) {
+        // This is a position in the selected workload, not a trace motion ID.
+        benchmark_motion_offsets.push_back(selected_total);
 
-                const uint64_t pose_id = first_pose + j;
+        for (uint64_t local_motion = 0;
+             local_motion < selected_motions;
+             ++local_motion) {
 
-                for (uint64_t query_id = trace.pose_offsets[pose_id];
-                     query_id < trace.pose_offsets[pose_id + 1];
-                     ++query_id) {
-                    ordered_query_ids.push_back(query_id);
+            const uint64_t motion_id =
+                benchmark_begin + local_motion;
+
+            const uint64_t first_pose =
+                trace.motion_offsets[motion_id];
+
+            const uint64_t last_pose =
+                trace.motion_offsets[motion_id + 1];
+
+            const uint64_t num_poses =
+                last_pose - first_pose;
+
+            if (num_poses == 0) {
+                std::cerr << "Motion " << motion_id
+                          << " contains no poses." << std::endl;
+                std::exit(1);
+            }
+
+            // Process the final pose first.
+            const uint64_t final_pose = last_pose - 1;
+
+            for (uint64_t query_id = trace.pose_offsets[final_pose];
+                 query_id < trace.pose_offsets[final_pose + 1];
+                 ++query_id) {
+                ordered_query_ids.push_back(query_id);
+            }
+
+            // Process the remaining poses in csp_rearrange order.
+            for (uint32_t i = 0; i < 8; ++i) {
+                for (uint64_t j = pose_offsets_order[i];
+                     j < num_poses - 1;
+                     j += 8) {
+
+                    const uint64_t pose_id = first_pose + j;
+
+                    for (uint64_t query_id = trace.pose_offsets[pose_id];
+                         query_id < trace.pose_offsets[pose_id + 1];
+                         ++query_id) {
+                        ordered_query_ids.push_back(query_id);
+                    }
                 }
             }
+
+            ordered_query_offsets.push_back(
+                ordered_query_ids.size());
         }
 
-        ordered_query_offsets.push_back(
-            ordered_query_ids.size());
+        selected_total += selected_motions;
+    }
+
+    if (selected_total == 0) {
+        std::cerr << "COORD workload contains no motions."
+                  << std::endl;
+        std::exit(1);
     }
 
     std::cout << "COORD ordered-query workload:" << std::endl;
-    std::cout << "  Benchmark index: " << benchmark_index << std::endl;
-    std::cout << "  Benchmark ID:    "
-              << trace.benchmark_ids[benchmark_index] << std::endl;
+    if (all_benchmarks) {
+        std::cout << "  Benchmarks:      all" << std::endl;
+    } else {
+        std::cout << "  Benchmark index: " << benchmark_index << std::endl;
+        std::cout << "  Benchmark ID:    "
+                  << trace.benchmark_ids[benchmark_index] << std::endl;
+    }
     std::cout << "  First motion:    " << first_motion << std::endl;
-    std::cout << "  Motions:         " << selected_motions << std::endl;
+    std::cout << "  Motions:         " << selected_total << std::endl;
+    std::cout << "  CHT resets:      "
+              << benchmark_motion_offsets.size() << std::endl;
     std::cout << "  Ordered queries: "
               << ordered_query_ids.size() << std::endl;
 }
@@ -505,6 +564,7 @@ int main(int argc, char** argv) {
 
     std::vector<uint64_t> h_ordered_query_offsets;
     std::vector<uint64_t> h_ordered_query_ids;
+    std::vector<uint64_t> h_coord_benchmark_offsets;
 
     if (trace_mode) {
         std::string error;
@@ -528,11 +588,13 @@ int main(int argc, char** argv) {
         if (coord_mode) {
             build_coord_ordered_queries(
                 trace,
+                coord_all_benchmarks,
                 coord_benchmark,
                 requested_num_motions,
                 coord_first_motion,
                 h_ordered_query_offsets,
-                h_ordered_query_ids);
+                h_ordered_query_ids,
+                h_coord_benchmark_offsets);
 
             num_motions =
                 static_cast<uint32_t>(h_ordered_query_offsets.size() - 1);
@@ -631,6 +693,7 @@ int main(int argc, char** argv) {
 
     vx_buffer_h ordered_query_offsets_buf = nullptr;
     vx_buffer_h ordered_query_ids_buf = nullptr;
+    vx_buffer_h coord_benchmark_offsets_buf = nullptr;
     vx_buffer_h coord_cht_buf = nullptr;
 
     if (trace_mode) {
@@ -670,6 +733,12 @@ int main(int argc, char** argv) {
                 h_ordered_query_ids.size() * sizeof(uint64_t),
                 VX_MEM_READ,
                 &ordered_query_ids_buf));
+
+            CHECK(vx_buffer_create(
+                dev,
+                h_coord_benchmark_offsets.size() * sizeof(uint64_t),
+                VX_MEM_READ,
+                &coord_benchmark_offsets_buf));
 
             CHECK(vx_buffer_create(
                 dev,
@@ -738,6 +807,10 @@ int main(int argc, char** argv) {
                 &kernel_arg.ordered_query_ids_addr));
 
             CHECK(vx_buffer_address(
+                coord_benchmark_offsets_buf,
+                &kernel_arg.benchmark_offsets_addr));
+
+            CHECK(vx_buffer_address(
                 coord_cht_buf,
                 &kernel_arg.coord_cht_addr));
 
@@ -751,6 +824,8 @@ int main(int argc, char** argv) {
             kernel_arg.coord_update_probability =
                 coord_update_probability;
             kernel_arg.coord_num_motions = num_motions;
+            kernel_arg.coord_num_benchmarks =
+                static_cast<uint32_t>(h_coord_benchmark_offsets.size());
 
             kernel_arg.coord_update_threshold =
                 static_cast<uint64_t>(
@@ -809,6 +884,12 @@ int main(int argc, char** argv) {
                 q, ordered_query_ids_buf, 0,
                 h_ordered_query_ids.data(),
                 h_ordered_query_ids.size() * sizeof(uint64_t),
+                0, nullptr, nullptr));
+
+            CHECK(vx_enqueue_write(
+                q, coord_benchmark_offsets_buf, 0,
+                h_coord_benchmark_offsets.data(),
+                h_coord_benchmark_offsets.size() * sizeof(uint64_t),
                 0, nullptr, nullptr));
         }
     } else {
@@ -1000,6 +1081,7 @@ int main(int argc, char** argv) {
     if (trace_mode) {
         if (coord_mode) {
             vx_buffer_release(coord_cht_buf);
+            vx_buffer_release(coord_benchmark_offsets_buf);
             vx_buffer_release(ordered_query_ids_buf);
             vx_buffer_release(ordered_query_offsets_buf);
         }

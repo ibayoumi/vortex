@@ -82,6 +82,7 @@ typedef struct {
     float coord_threshold;
     float coord_update_probability;
     uint32_t coord_num_motions;
+    uint32_t coord_num_benchmarks;
     uint64_t coord_update_threshold;
 
     // COORD scheduler buffers.

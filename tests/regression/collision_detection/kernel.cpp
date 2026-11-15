@@ -681,23 +681,36 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
             reinterpret_cast<coord_cht_entry_t*>(
                 arg->coord_cht_addr);
 
+        auto benchmark_motion_offsets =
+            reinterpret_cast<const uint64_t*>(
+                arg->benchmark_offsets_addr);
+
         auto results =
             reinterpret_cast<coord_result_t*>(
                 arg->coord_results_addr);
 
-        // Reset the CHT once at the start of this benchmark.
-        for (uint32_t i = 0; i < COORD_CHT_ENTRIES; ++i) {
-            cht[i].collision_count = 0;
-            cht[i].free_count = 0;
-        }
-
-        // Initialize one Python-compatible random stream for the benchmark.
+        // Initialize one Python-compatible random stream for the
+        // entire workload. The RNG continues across benchmark boundaries.
         coord_rng_t rng;
         mt_seed_by_array(&rng, arg->coord_seed);
+
+        uint32_t next_benchmark = 0;
 
         for (uint32_t current_motion = 0;
              current_motion < arg->coord_num_motions;
              ++current_motion) {
+
+            // Reset the CHT at the start of each selected benchmark.
+            if (next_benchmark < arg->coord_num_benchmarks &&
+                current_motion ==
+                    benchmark_motion_offsets[next_benchmark]) {
+                for (uint32_t i = 0; i < COORD_CHT_ENTRIES; ++i) {
+                    cht[i].collision_count = 0;
+                    cht[i].free_count = 0;
+                }
+
+                ++next_benchmark;
+            }
 
             const uint64_t query_begin =
                 ordered_query_offsets[current_motion];
